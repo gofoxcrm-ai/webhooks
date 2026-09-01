@@ -1,51 +1,45 @@
 # Gofox Outbound Webhooks
 
-Push **real-time CRM events** from Gofox to your HTTPS endpoint. Pattern matches EngageBay-style [Webhooks](https://www.engagebay.com/api): configure a URL, verify signatures, process JSON.
+Push **real-time CRM events** from Gofox to your HTTPS endpoint. Configure a URL, verify signatures, process JSON.
 
 > Sibling products: [REST API](https://github.com/gofoxcrm-ai/restapi) · [Tracking Code API](https://github.com/gofoxcrm-ai/trackingcodeapi) · [SSO](https://github.com/gofoxcrm-ai/sso)
 
----
-
-## Status
-
-| Area | Status |
-|------|--------|
-| Tenant webhook CRUD + test + delivery logs | ✅ Live |
-| Signed deliveries (`X-Gofox-Signature`) | ✅ Live |
-| Retries (BullMQ backoff) | ✅ Live |
-| Screenshots / setup video | 🚧 Placeholders below |
-
-> **Note:** Inbound provider webhooks (Razorpay, WhatsApp, telephony, etc.) are separate. This repo covers **outbound CRM → your app**.
+**Phased docs:** [PHASES.md](./PHASES.md)
 
 ---
+
+## Status overview
+
+| Phase | Area | Status |
+|-------|------|--------|
+| 1 | Outbound CRM → your app | ✅ Live |
+| 2 | Emit matrix & payload contract | ✅ Documented (matches code) |
+| 3 | Inbound ESP/SMS webhooks (ops) | ✅ Live (Connected Apps / BYOK) |
+| Media | Screenshots / video | 🚧 Placeholders |
+
+> This product docs set is primarily **outbound** (Gofox → you). Phase 3 covers **inbound** provider callbacks for ESP/SMS configuration.
+
+---
+
+# Phase 1 — Outbound webhooks
 
 ## Setup
 
-1. Plan feature **`webhooks`** / **`api_access`** required.
+1. Plan feature **`webhooks`** (Prime+; aliased with `api_access`).
 2. Gofox UI: **Account Settings → Webhooks**
 3. Add HTTPS URL + select events
-4. Copy the **signing secret**
+4. Copy the **signing secret** (shown once on create)
 5. Use **Test** to send a sample payload
-
-<!-- SCREENSHOT: docs/assets/webhooks-settings.png
-     Placeholder — Webhooks settings page with URL, events, Test button.
--->
 
 ![Webhooks settings (placeholder)](docs/assets/webhooks-settings.png)
 
-<!-- VIDEO: docs/assets/webhooks-setup.mp4
-     Placeholder — create endpoint, receive Test hit on webhook.site, verify signature.
--->
-
 [Setup video (placeholder)](docs/assets/webhooks-setup.mp4)
 
----
+## Events (allow-list)
 
-## Events (working)
-
-| Event | When |
-|-------|------|
-| `lead.created` | Lead created / ingested |
+| Event | Description |
+|-------|-------------|
+| `lead.created` | Lead created via **public ingest / form** pipelines |
 | `contact.created` | Contact created |
 | `contact.updated` | Contact updated |
 | `deal.created` | Deal created |
@@ -54,26 +48,20 @@ Push **real-time CRM events** from Gofox to your HTTPS endpoint. Pattern matches
 | `invoice.paid` | Invoice marked paid |
 | `form.submitted` | Public form submission |
 
-Additional events (`company.*`, `task.*`, `deal.stage_changed`, …) can be added in `gofox-server/src/lib/outbound-webhooks.ts` — document them here when shipped.
-
----
-
-## Delivery payload
+## Delivery request
 
 ```http
 POST https://your-app.example.com/hooks/gofox
 Content-Type: application/json
-X-Gofox-Signature: <hex hmac-sha256>
+X-Gofox-Signature: <hex hmac-sha256 of raw body>
 X-Gofox-Event: contact.created
-X-Gofox-Delivery-Id: del_…
 ```
 
 ```json
 {
-  "id": "evt_…",
   "event": "contact.created",
-  "createdAt": "2026-07-20T12:00:00.000Z",
   "organizationId": "org_…",
+  "occurredAt": "2026-07-20T12:00:00.000Z",
   "data": {
     "id": "contact_…",
     "email": "ada@example.com",
@@ -82,11 +70,12 @@ X-Gofox-Delivery-Id: del_…
 }
 ```
 
----
+**Contract notes (as implemented):**
+- Body fields: `event`, `organizationId`, `occurredAt`, `data`
+- There is **no** `X-Gofox-Delivery-Id` header today
+- Signature is HMAC-SHA256 hex of the **exact raw JSON body** using the subscription secret
 
 ## Verify signatures
-
-Compute HMAC-SHA256 of the **raw request body** with your webhook secret; compare to `X-Gofox-Signature` (hex).
 
 ### Node.js
 
@@ -113,37 +102,79 @@ def verify_gofox_signature(raw_body: bytes, secret: str, header: str) -> bool:
 
 Always read the **raw** body before JSON parsing.
 
----
-
 ## Retries & SSRF
 
-- Non-2xx responses are retried with exponential backoff (BullMQ).
-- Inspect delivery history in the Webhooks UI.
-- Target URL must be public HTTPS (http allowed in local/dev). Private / link-local IPs are rejected.
-
----
+- Non-2xx responses are retried with exponential backoff via **BullMQ** when `REDIS_URL` is set (5 attempts, starting ~10s). Without Redis, delivery is attempted synchronously.
+- Request timeout: **10 seconds**
+- Inspect delivery history in the Webhooks UI
+- Target URL must be public **HTTPS** in production (`http` only when `NODE_ENV=development` or `ALLOW_HTTP_WEBHOOKS=true`)
+- Private / link-local IPs are rejected (SSRF protection)
 
 ## Tenant management API
 
-Authenticated with session JWT (not public API key by default):
+Authenticated with **session JWT** (Account Settings user), not a public API key:
 
 ```
-GET|POST   /api/v1/tenant/webhooks
-PATCH|DELETE /api/v1/tenant/webhooks/:id
-POST       /api/v1/tenant/webhooks/:id/test
-GET        /api/v1/tenant/webhooks/:id/deliveries
+GET    /api/v1/tenant/webhooks
+POST   /api/v1/tenant/webhooks
+PATCH  /api/v1/tenant/webhooks/:subscriptionId
+DELETE /api/v1/tenant/webhooks/:subscriptionId
+POST   /api/v1/tenant/webhooks/:subscriptionId/test
+GET    /api/v1/tenant/webhooks/deliveries?subscriptionId=
 ```
 
-Implementation: `gofox-server/src/modules/webhooks/`.
+`GET /` also returns `availableEvents`. Create response includes `secret` once.
+
+Implementation: `gofox-server/src/modules/webhooks/` + `gofox-server/src/lib/outbound-webhooks.ts`.
 
 ---
 
-## Adding events
+# Phase 2 — Event emit matrix
 
-1. Emit from the domain service via `emitOutboundWebhook(...)` (or shared helper)
-2. Register the event name in the allow-list / UI enum
-3. Add a row to the Events table in this README
-4. Include a sample `data` shape in docs when payloads diverge
+What actually fires today (important for integrators):
+
+| Event | Emitted from |
+|-------|----------------|
+| `lead.created` | Public lead **ingest** / form ingest services — **not** every UI/REST `createLead` path |
+| `form.submitted` | Public form submission pipeline |
+| `contact.created` / `contact.updated` | Contacts service |
+| `deal.created` / `deal.updated` | Deals service |
+| `ticket.created` | Tickets service |
+| `invoice.paid` | Invoices service (paid status) |
+
+If you need `lead.created` for every CRM create, prefer listening to ingest/forms or open a product request to emit from REST/UI creates as well.
+
+### Adding events
+
+1. Emit via `emitOutboundWebhook(...)` from the domain service
+2. Add the name to `OUTBOUND_WEBHOOK_EVENTS` in `outbound-webhooks.ts`
+3. Expose it in the Webhooks UI enum
+4. Document the row here + sample `data` shape
+5. Update [PHASES.md](./PHASES.md)
+
+---
+
+# Phase 3 — Inbound provider webhooks (ops)
+
+These receive events **from** email/SMS providers into Gofox (Connected Apps / BYOK). They are **not** the outbound product, but ops teams need the URLs.
+
+Base: `https://api.gofox.io/api/v1/public/messaging`
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/webhooks/ses` | Amazon SES bounce/delivery/open/click |
+| `POST` | `/webhooks/sendgrid/:organizationId` | SendGrid events |
+| `POST` | `/webhooks/mailgun/:organizationId` | Mailgun events |
+| `POST` | `/webhooks/mandrill/:organizationId` | Mandrill events |
+| `POST` | `/webhooks/twilio/:organizationId` | Twilio SMS |
+| `POST` | `/webhooks/exotel/:organizationId` | Exotel |
+| `POST`/`GET` | `/webhooks/gupshup/:organizationId` | Gupshup |
+| `GET` | `/track/open.gif`, `/track/open/:token` | Email open pixel |
+| `GET` | `/track/click/:token` | Email click redirect |
+
+Configure these in your ESP/SMS provider dashboard to match the Connected App for that organization. Signature validation is provider-specific (implemented server-side).
+
+Env related to outbound: `REDIS_URL`, `ALLOW_HTTP_WEBHOOKS`, `WEBHOOK_DISPATCH_WORKER_CONCURRENCY`.
 
 ---
 
